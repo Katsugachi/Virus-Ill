@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Simple Cell Simulator</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    #controls { margin-bottom:20px; }
+    #drug-table { width:100%; border-collapse: collapse; margin-top:10px; }
+    #drug-table th, #drug-table td { border:1px solid #ccc; padding:5px; text-align:center; }
+    #sim-container { display:flex; }
+    #three-container { width:400px; height:300px; border:1px solid #333; }
+    #right-panel { margin-left:20px; }
+    #sim-canvas { border:1px solid #333; background:#f9f9f9; }
+    #log { height:100px; overflow:auto; border:1px solid #ccc; padding:5px;
+           margin-top:10px; background:#f9f9f9; font-size:0.9em; }
+    .warning { color:red; font-weight:bold; }
+  </style>
+</head>
+<body>
+
+  <h1>Simple Cell Simulator</h1>
+  <p class="warning">
+    Prototype for research only. Not validated for human dosing or treatment decisions.
+  </p>
+
+  <div id="controls">
+    <label>
+      Scenario:
+      <select id="virus-select">
+        <option value="influenza">Influenza (H1N1)</option>
+        <option value="cov2">SARS-CoV-2</option>
+        <option value="hiv">HIV-1</option>
+        <option value="cancer">Cancer</option>
+      </select>
+    </label>
+
+    <h3>Enter Drug PK/PD Parameters</h3>
+    <table id="drug-table">
+      <thead>
+        <tr>
+          <th>Drug</th>
+          <th>Dose (mg)</th>
+          <th>Vd (L)</th>
+          <th>t½ (h)</th>
+          <th>EC₅₀ (ng/mL)</th>
+          <th>Hill</th>
+          <th>Remove</th>
+        </tr>
+      </thead>
+      <tbody id="drug-body"></tbody>
+    </table>
+    <button id="add-drug">+ Add Drug</button>
+    <br/><br/>
+    <button id="start-btn">Start</button>
+    <button id="reset-btn">Reset</button>
+  </div>
+
+  <div id="sim-container">
+    <div id="three-container"></div>
+    <div id="right-panel">
+      <canvas id="sim-canvas" width="400" height="200"></canvas>
+      <div id="stats"></div>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <!-- three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+  // --- PARAMETERS ---
+  const VIRUS_PARAMS = {
+    influenza: { r:1.0,   K:1e4,   damage:0.01 },
+    cov2:      { r:1.2,   K:2e4,   damage:0.02 },
+    hiv:       { r:0.5,   K:5e3,   damage:0.005 },
+    cancer:    { r:0.8,   K:1e6,   damage:0.008 }
+  };
+
+  // --- UI REFS ---
+  const virusSelect = document.getElementById('virus-select');
+  const drugBody     = document.getElementById('drug-body');
+  const addDrugBtn   = document.getElementById('add-drug');
+  const startBtn     = document.getElementById('start-btn');
+  const resetBtn     = document.getElementById('reset-btn');
+  const canvas2d     = document.getElementById('sim-canvas');
+  const ctx2d        = canvas2d.getContext('2d');
+  const statsDiv     = document.getElementById('stats');
+  const logDiv       = document.getElementById('log');
+  let simState, animId, lastLogTime;
+
+  // --- three.js SETUP ---
+  let scene, camera, renderer, cellGroup, membrane, nucleus;
+  function initThree() {
+    scene    = new THREE.Scene();
+    camera   = new THREE.PerspectiveCamera(45, 400/300, 0.1, 1000);
+    renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(400,300);
+    document.getElementById('three-container').appendChild(renderer.domElement);
+
+    // Create a cellGroup to hold membrane + organelles
+    cellGroup = new THREE.Group();
+
+    // Outer membrane (transparent)
+    const memGeom = new THREE.SphereGeometry(1,32,32);
+    const memMat  = new THREE.MeshPhongMaterial({
+      color: 0x00ff00, transparent: true, opacity: 0.25, side: THREE.DoubleSide
+    });
+    membrane = new THREE.Mesh(memGeom, memMat);
+    cellGroup.add(membrane);
+
+    // Nucleus
+    const nucGeom = new THREE.SphereGeometry(0.5, 24,24);
+    const nucMat  = new THREE.MeshPhongMaterial({
+      color: 0x0000ff, transparent: true, opacity: 0.5
+    });
+    nucleus = new THREE.Mesh(nucGeom, nucMat);
+    cellGroup.add(nucleus);
+
+    // Mitochondria (small orange spheres)
+    const mitoMat = new THREE.MeshPhongMaterial({ color:0xffaa00 });
+    for(let i=0; i<8; i++){
+      const r = 0.1 + Math.random()*0.1;
+      const geo = new THREE.SphereGeometry(r,16,16);
+      const mito = new THREE.Mesh(geo, mitoMat);
+      const phi   = Math.random()*Math.PI;
+      const theta = Math.random()*2*Math.PI;
+      const rad   = 0.7;
+      mito.position.set(
+        rad*Math.sin(phi)*Math.cos(theta),
+        rad*Math.sin(phi)*Math.sin(theta),
+        rad*Math.cos(phi)
+      );
+      cellGroup.add(mito);
+    }
+
+    scene.add(cellGroup);
+
+    // Lighting
+    const ambient = new THREE.AmbientLight(0x888888);
+    const light   = new THREE.PointLight(0xffffff,1);
+    light.position.set(5,5,5);
+    scene.add(ambient, light);
+
+    camera.position.set(0,0,5);
+  }
+  initThree();
+
+  // Add one drug row
+  function addDrugRow(){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="text" placeholder="Name" /></td>
+      <td><input type="number" value="100" min="0" /></td>
+      <td><input type="number" value="50"  min="0" /></td>
+      <td><input type="number" value="12"  min="0" /></td>
+      <td><input type="number" value="200" min="0" /></td>
+      <td><input type="number" value="1"   min="0.1" step="0.1"/></td>
+      <td><button class="remove">x</button></td>
+    `;
+    tr.querySelector('.remove').onclick = ()=> tr.remove();
+    drugBody.appendChild(tr);
+  }
+  addDrugBtn.onclick = addDrugRow;
+
+  // Initialize sim state
+  function resetSimulation(){
+    cancelAnimationFrame(animId);
+    simState = {
+      time:0,
+      viralLoad:1,
+      health:100,
+      virus: VIRUS_PARAMS[virusSelect.value],
+      drugs: []
+    };
+    lastLogTime = -1;
+    ctx2d.clearRect(0,0,400,200);
+    statsDiv.textContent = '';
+    logDiv.textContent = '';
+  }
+
+  // Read drugs and start
+  function startSimulation(){
+    resetSimulation();
+    simState.drugs = Array.from(drugBody.children).map(tr=>{
+      const [name,dose,Vd,tHalf,EC50,hill] = tr.querySelectorAll('input');
+      const kel = Math.log(2)/parseFloat(tHalf.value);
+      return {
+        name: name.value||'Drug',
+        dose:parseFloat(dose.value),
+        Vd:parseFloat(Vd.value),
+        kel, EC50:parseFloat(EC50.value),
+        hill:parseFloat(hill.value)
+      };
+    });
+    animate();
+  }
+
+  // Main loop
+  function animate(){
+    const dt = 0.1;
+    simState.time += dt;
+
+    // PK/PD block factor
+    let block = 1;
+    simState.drugs.forEach(d=>{
+      const C = (d.dose/d.Vd)*Math.exp(-d.kel*simState.time);
+      const E = Math.pow(C,d.hill)/(Math.pow(C,d.hill)+Math.pow(d.EC50,d.hill));
+      block *= (1 - E);
+    });
+
+    // Pathogen growth
+    const {r,K,damage} = simState.virus;
+    const effR = r * block;
+    let dV = simState.viralLoad * effR;
+    if(K<Infinity) dV *= (1 - simState.viralLoad/K);
+    simState.viralLoad = Math.max(0, simState.viralLoad + dV*dt);
+
+    // Cell health decline
+    simState.health = Math.max(0,
+      simState.health - damage * simState.viralLoad * dt
+    );
+
+    draw2D();
+    update3D();
+    logEvents();
+
+    if(simState.health>0 && simState.time<240) {
+      animId = requestAnimationFrame(animate);
+    }
+  }
+
+  // 2D bars & stats
+  function draw2D(){
+    ctx2d.clearRect(0,0,400,200);
+    // viral load bar
+    ctx2d.fillStyle='#ddd'; ctx2d.fillRect(30,30,200,20);
+    ctx2d.fillStyle='crimson';
+    const vW = Math.min(200, (simState.viralLoad/(simState.virus.K||1e6))*200);
+    ctx2d.fillRect(30,30,vW,20);
+    ctx2d.fillStyle='#000'; ctx2d.fillText(
+      `Load: ${simState.viralLoad.toFixed(1)}`,240,45
+    );
+    // health bar
+    ctx2d.fillStyle='#ddd'; ctx2d.fillRect(30,70,200,20);
+    ctx2d.fillStyle='green';
+    ctx2d.fillRect(30,70,(simState.health/100)*200,20);
+    ctx2d.fillStyle='#000'; ctx2d.fillText(
+      `Health: ${simState.health.toFixed(1)}%`,240,85
+    );
+    // time
+    ctx2d.fillText(`Time: ${simState.time.toFixed(1)} h`,30,120);
+    // stats panel
+    statsDiv.innerHTML = `
+      Scenario: ${virusSelect.value}<br/>
+      Drugs: ${simState.drugs.length}<br/>
+      Time: ${simState.time.toFixed(1)} h
+    `;
+  }
+
+  // Update three.js: color/scale + slow spin
+  function update3D(){
+    const h = simState.health/100;
+    // Update membrane tint
+    membrane.material.color.setRGB(1-h, h, 0);
+    // Scale entire group
+    const scale = 0.5 + h*0.5;
+    cellGroup.scale.set(scale, scale, scale);
+    // Slow rotation
+    cellGroup.rotation.y += 0.005;
+    renderer.render(scene, camera);
+  }
+
+  // Append log every full time unit
+  function logEvents(){
+    if(Math.floor(simState.time) > lastLogTime){
+      lastLogTime = Math.floor(simState.time);
+      const entry = document.createElement('div');
+      entry.textContent = 
+        `t=${simState.time.toFixed(1)} h → ` +
+        `Load=${simState.viralLoad.toFixed(1)}, ` +
+        `Health=${simState.health.toFixed(1)}%`;
+      logDiv.appendChild(entry);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+  }
+
+  // Bind controls
+  startBtn.onclick = startSimulation;
+  resetBtn.onclick = resetSimulation;
+
+  // Boot
+  addDrugRow();
+  resetSimulation();
+
+  </script>
+</body>
+</html>
